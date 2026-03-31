@@ -1,0 +1,731 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import JSZip from "jszip";
+import Papa from "papaparse";
+import {
+  Search,
+  Bus,
+  MapPinned,
+  Moon,
+  Sun,
+  Upload,
+  Route,
+  Layers,
+  Info,
+  Map
+} from "lucide-react";
+import {
+  MapContainer,
+  TileLayer,
+  Polyline,
+  Marker,
+  Popup,
+  useMap
+} from "react-leaflet";
+import L from "leaflet";
+
+const defaultCenter = [17.385, 78.4867]; // Hyderabad
+
+const stopIcon = new L.DivIcon({
+  className: "",
+  html: `<div style="width:10px;height:10px;border-radius:9999px;background:#0f172a;border:2px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.25)"></div>`,
+  iconSize: [10, 10],
+  iconAnchor: [5, 5],
+});
+
+function csvToJson(text) {
+  return Papa.parse(text, { header: true, skipEmptyLines: true }).data;
+}
+
+function parseTimeToSeconds(t) {
+  if (!t || typeof t !== "string") return null;
+  const [h, m, s] = t.split(":").map(Number);
+  return h * 3600 + m * 60 + s;
+}
+
+function formatClock(sec) {
+  if (sec == null || Number.isNaN(sec)) return "—";
+  const h = Math.floor(sec / 3600) % 24;
+  const m = Math.floor((sec % 3600) / 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function FitBounds({ routeStops, selectedStop }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!map) return;
+
+    if (routeStops?.length > 1) {
+      const bounds = L.latLngBounds(
+        routeStops.map((s) => [Number(s.stop_lat), Number(s.stop_lon)])
+      );
+      map.fitBounds(bounds.pad(0.15));
+    } else if (selectedStop) {
+      map.flyTo(
+        [Number(selectedStop.stop_lat), Number(selectedStop.stop_lon)],
+        15,
+        { duration: 0.75 }
+      );
+    }
+  }, [map, routeStops, selectedStop]);
+
+  return null;
+}
+
+export default function HyderabadGTFSExplorer() {
+  const [dark, setDark] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState("Initializing…");
+  const [gtfs, setGtfs] = useState(null);
+  const [query, setQuery] = useState("");
+  const [routeQuery, setRouteQuery] = useState("");
+  const [selectedRoute, setSelectedRoute] = useState(null);
+  const [selectedStop, setSelectedStop] = useState(null);
+  const [showStops, setShowStops] = useState(true);
+  const [maxVisibleStops, setMaxVisibleStops] = useState(250);
+  const fileRef = useRef(null);
+
+  async function loadZip(file) {
+    setLoading(true);
+    setStatusText("Loading GTFS feed…");
+
+    try {
+      const zip = await JSZip.loadAsync(file);
+
+      const needed = [
+        "stops.txt",
+        "routes.txt",
+        "trips.txt",
+        "stop_times.txt",
+        "calendar.txt"
+      ];
+
+      const missing = needed.filter((f) => !zip.file(f));
+      if (missing.length) {
+        throw new Error(`Missing required GTFS files: ${missing.join(", ")}`);
+      }
+
+      const [
+        stopsTxt,
+        routesTxt,
+        tripsTxt,
+        stopTimesTxt,
+        calendarTxt,
+        agencyTxt,
+        feedInfoTxt
+      ] = await Promise.all([
+        zip.file("stops.txt").async("string"),
+        zip.file("routes.txt").async("string"),
+        zip.file("trips.txt").async("string"),
+        zip.file("stop_times.txt").async("string"),
+        zip.file("calendar.txt").async("string"),
+        zip.file("agency.txt")?.async("string") ?? Promise.resolve(""),
+        zip.file("feed_info.txt")?.async("string") ?? Promise.resolve("")
+      ]);
+
+      const stops = csvToJson(stopsTxt);
+      const routes = csvToJson(routesTxt);
+      const trips = csvToJson(tripsTxt);
+      const stopTimes = csvToJson(stopTimesTxt);
+      const calendar = csvToJson(calendarTxt);
+      const agency = agencyTxt ? csvToJson(agencyTxt) : [];
+      const feedInfo = feedInfoTxt ? csvToJson(feedInfoTxt) : [];
+
+      const stopsById = Object.fromEntries(
+        stops.map((s) => [String(s.stop_id), s])
+      );
+
+      const tripsByRoute = {};
+      trips.forEach((t) => {
+        const rid = String(t.route_id);
+        if (!tripsByRoute[rid]) tripsByRoute[rid] = [];
+        tripsByRoute[rid].push(t);
+      });
+
+      const stopTimesByTrip = {};
+      stopTimes.forEach((st) => {
+        const tid = String(st.trip_id);
+        if (!stopTimesByTrip[tid]) stopTimesByTrip[tid] = [];
+        stopTimesByTrip[tid].push(st);
+      });
+
+      Object.values(stopTimesByTrip).forEach((arr) =>
+        arr.sort((a, b) => Number(a.stop_sequence) - Number(b.stop_sequence))
+      );
+
+      const enrichedRoutes = routes.map((r) => {
+        const rid = String(r.route_id);
+        const routeTrips = tripsByRoute[rid] || [];
+        const sampleTrip = routeTrips[0];
+        const sampleStops = sampleTrip
+          ? (stopTimesByTrip[String(sampleTrip.trip_id)] || [])
+              .map((st) => stopsById[String(st.stop_id)])
+              .filter(Boolean)
+          : [];
+
+        return {
+          ...r,
+          route_id: rid,
+          trip_count: routeTrips.length,
+          stop_count: sampleStops.length,
+          sampleStops,
+          sampleTrip
+        };
+      });
+
+      const stopRouteMap = {};
+      trips.forEach((t) => {
+        const rid = String(t.route_id);
+        const tid = String(t.trip_id);
+
+        (stopTimesByTrip[tid] || []).forEach((st) => {
+          const sid = String(st.stop_id);
+          if (!stopRouteMap[sid]) stopRouteMap[sid] = new Set();
+          stopRouteMap[sid].add(rid);
+        });
+      });
+
+      setGtfs({
+        agency,
+        feedInfo,
+        calendar,
+        stops,
+        routes: enrichedRoutes,
+        trips,
+        stopTimesByTrip,
+        tripsByRoute,
+        stopsById,
+        stopRouteMap
+      });
+
+      setSelectedRoute(enrichedRoutes[0] || null);
+      setSelectedStop(null);
+      setStatusText("GTFS loaded successfully");
+    } catch (err) {
+      setStatusText(`Load failed: ${err.message || "Failed to load GTFS ZIP"}`);
+      alert(err.message || "Failed to load GTFS ZIP");
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        setLoading(true);
+        setStatusText("Preloading Hyderabad GTFS…");
+        const res = await fetch("/data/tgsrtc_gtfs.zip");
+        if (!res.ok) {
+          throw new Error(
+            "Preloaded GTFS not found. Add it at public/data/tgsrtc_gtfs.zip"
+          );
+        }
+        const blob = await res.blob();
+        const file = new File([blob], "tgsrtc_gtfs.zip", {
+          type: "application/zip"
+        });
+        await loadZip(file);
+      } catch (e) {
+        console.warn(e);
+        setStatusText(
+          "Preload unavailable — upload GTFS ZIP manually or place file in public/data/tgsrtc_gtfs.zip"
+        );
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const filteredRoutes = useMemo(() => {
+    if (!gtfs) return [];
+    return gtfs.routes
+      .filter(
+        (r) =>
+          !routeQuery ||
+          String(r.route_long_name || r.route_id)
+            .toLowerCase()
+            .includes(routeQuery.toLowerCase()) ||
+          String(r.route_short_name || "")
+            .toLowerCase()
+            .includes(routeQuery.toLowerCase())
+      )
+      .sort((a, b) =>
+        String(a.route_long_name || a.route_id).localeCompare(
+          String(b.route_long_name || b.route_id),
+          undefined,
+          { numeric: true }
+        )
+      );
+  }, [gtfs, routeQuery]);
+
+  const filteredStops = useMemo(() => {
+    if (!gtfs) return [];
+    return gtfs.stops
+      .filter(
+        (s) =>
+          !query ||
+          String(s.stop_name).toLowerCase().includes(query.toLowerCase())
+      )
+      .slice(0, 250);
+  }, [gtfs, query]);
+
+  const selectedRouteStops = useMemo(
+    () => selectedRoute?.sampleStops || [],
+    [selectedRoute]
+  );
+
+  const routeStopIds = useMemo(
+    () => new Set(selectedRouteStops.map((s) => String(s.stop_id))),
+    [selectedRouteStops]
+  );
+
+  const routeTripTimes = useMemo(() => {
+    if (!gtfs || !selectedRoute?.sampleTrip) return [];
+    return gtfs.stopTimesByTrip[String(selectedRoute.sampleTrip.trip_id)] || [];
+  }, [gtfs, selectedRoute]);
+
+  const theme = dark
+    ? "linear-gradient(135deg, #020617, #0f172a, #111827)"
+    : "linear-gradient(135deg, #f8fafc, #e2e8f0, #cbd5e1)";
+
+  const textColor = dark ? "#e2e8f0" : "#0f172a";
+  const panelBg = dark ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.85)";
+  const borderColor = dark ? "rgba(255,255,255,0.08)" : "#dbe4ee";
+  const inputBg = dark ? "#0f172a" : "#ffffff";
+  const inputColor = dark ? "#e2e8f0" : "#0f172a";
+
+  return (
+    <div
+      style={{
+        background: theme,
+        color: textColor,
+        minHeight: "100vh",
+        width: "100%",
+        overflow: "hidden"
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "18px 24px",
+          borderBottom: `1px solid ${borderColor}`,
+          backdropFilter: "blur(10px)"
+        }}
+      >
+        <div>
+          <h1
+            style={{
+              margin: 0,
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              fontSize: 28
+            }}
+          >
+            <Bus size={28} /> Hyderabad GTFS Explorer
+          </h1>
+          <p style={{ marginTop: 8, opacity: 0.75 }}>
+            Public-ready Hyderabad transit explorer with preloaded GTFS support.
+          </p>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button
+            onClick={() => fileRef.current?.click()}
+            style={btnStyle(borderColor, panelBg, textColor)}
+          >
+            <Upload size={16} /> Upload GTFS ZIP
+          </button>
+
+          <button
+            onClick={() => setDark(!dark)}
+            style={btnStyle(borderColor, panelBg, textColor)}
+          >
+            {dark ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".zip"
+            style={{ display: "none" }}
+            onChange={(e) =>
+              e.target.files?.[0] && loadZip(e.target.files[0])
+            }
+          />
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "320px 1fr 340px",
+          gap: 16,
+          padding: 16,
+          height: "calc(100vh - 95px)"
+        }}
+      >
+        {/* LEFT PANEL */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <Panel title="Routes" icon={<Route size={16} />} panelBg={panelBg} borderColor={borderColor}>
+            <SearchInput
+              value={routeQuery}
+              onChange={setRouteQuery}
+              placeholder="Search route no..."
+              bg={inputBg}
+              color={inputColor}
+              borderColor={borderColor}
+            />
+
+            <div style={{ maxHeight: "42vh", overflowY: "auto", marginTop: 12 }}>
+              {filteredRoutes.map((route) => (
+                <button
+                  key={route.route_id}
+                  onClick={() => {
+                    setSelectedRoute(route);
+                    setSelectedStop(null);
+                  }}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    padding: 14,
+                    marginBottom: 10,
+                    borderRadius: 18,
+                    border:
+                      selectedRoute?.route_id === route.route_id
+                        ? "1px solid #22d3ee"
+                        : `1px solid ${borderColor}`,
+                    background:
+                      selectedRoute?.route_id === route.route_id
+                        ? "rgba(34,211,238,0.12)"
+                        : panelBg,
+                    color: textColor,
+                    cursor: "pointer"
+                  }}
+                >
+                  <div style={{ fontWeight: 700 }}>
+                    Route {route.route_short_name || route.route_long_name || route.route_id}
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.72, marginTop: 4 }}>
+                    Trips: {route.trip_count} • Sample stops: {route.stop_count}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </Panel>
+
+          <Panel title="Stops" icon={<MapPinned size={16} />} panelBg={panelBg} borderColor={borderColor}>
+            <SearchInput
+              value={query}
+              onChange={setQuery}
+              placeholder="Search stop name..."
+              bg={inputBg}
+              color={inputColor}
+              borderColor={borderColor}
+            />
+
+            <div style={{ maxHeight: "28vh", overflowY: "auto", marginTop: 12 }}>
+              {filteredStops.map((stop) => (
+                <button
+                  key={stop.stop_id}
+                  onClick={() => {
+                    setSelectedStop(stop);
+                    setSelectedRoute(null);
+                  }}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    padding: 14,
+                    marginBottom: 10,
+                    borderRadius: 18,
+                    border:
+                      selectedStop?.stop_id === stop.stop_id
+                        ? "1px solid #34d399"
+                        : `1px solid ${borderColor}`,
+                    background:
+                      selectedStop?.stop_id === stop.stop_id
+                        ? "rgba(52,211,153,0.12)"
+                        : panelBg,
+                    color: textColor,
+                    cursor: "pointer"
+                  }}
+                >
+                  <div style={{ fontWeight: 700 }}>{stop.stop_name}</div>
+                  <div style={{ fontSize: 12, opacity: 0.72, marginTop: 4 }}>
+                    {stop.stop_desc || stop.zone_id || "Stop"}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </Panel>
+        </div>
+
+        {/* MAP */}
+        <div
+          style={{
+            background: panelBg,
+            border: `1px solid ${borderColor}`,
+            borderRadius: 28,
+            padding: 10,
+            overflow: "hidden"
+          }}
+        >
+          <MapContainer center={defaultCenter} zoom={11} style={{ height: "100%", width: "100%" }}>
+            <TileLayer
+              attribution='&copy; OpenStreetMap contributors'
+              url={
+                dark
+                  ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                  : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              }
+            />
+
+            <FitBounds routeStops={selectedRouteStops} selectedStop={selectedStop} />
+
+            {selectedRouteStops.length > 1 && (
+              <Polyline
+                positions={selectedRouteStops.map((s) => [
+                  Number(s.stop_lat),
+                  Number(s.stop_lon)
+                ])}
+              />
+            )}
+
+            {showStops &&
+              (selectedRoute
+                ? selectedRouteStops.slice(0, maxVisibleStops)
+                : filteredStops.slice(0, 150)
+              ).map((stop) => (
+                <Marker
+                  key={stop.stop_id}
+                  position={[Number(stop.stop_lat), Number(stop.stop_lon)]}
+                  icon={stopIcon}
+                  eventHandlers={{ click: () => setSelectedStop(stop) }}
+                >
+                  <Popup>
+                    <div style={{ fontWeight: 700 }}>{stop.stop_name}</div>
+                    <div style={{ fontSize: 12 }}>
+                      {stop.stop_desc || "Bus Stop"}
+                    </div>
+                  </Popup>
+                </Marker>
+              ))}
+          </MapContainer>
+        </div>
+
+        {/* RIGHT PANEL */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <Panel title="Map Controls" icon={<Layers size={16} />} panelBg={panelBg} borderColor={borderColor}>
+            <label style={controlRow}>
+              <span>Show stops</span>
+              <input
+                type="checkbox"
+                checked={showStops}
+                onChange={(e) => setShowStops(e.target.checked)}
+              />
+            </label>
+
+            <label style={{ display: "block", marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                <span>Max visible route stops</span>
+                <span style={{ opacity: 0.7 }}>{maxVisibleStops}</span>
+              </div>
+              <input
+                type="range"
+                min="50"
+                max="500"
+                step="25"
+                value={maxVisibleStops}
+                onChange={(e) => setMaxVisibleStops(Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </label>
+
+            <div style={{ marginTop: 14, fontSize: 14, opacity: 0.8 }}>
+              {loading ? "Loading GTFS feed…" : statusText}
+            </div>
+            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.6 }}>
+              Preload file path: <code>public/data/tgsrtc_gtfs.zip</code>
+            </div>
+          </Panel>
+
+          <Panel title="Details" icon={<Info size={16} />} panelBg={panelBg} borderColor={borderColor}>
+            {!gtfs && (
+              <p style={{ opacity: 0.75 }}>
+                The app will auto-load your GTFS feed when hosted with the ZIP
+                in <code>public/data/tgsrtc_gtfs.zip</code>.
+              </p>
+            )}
+
+            {gtfs && selectedRoute && (
+              <div>
+                <h2 style={{ marginTop: 0 }}>
+                  Route {selectedRoute.route_short_name || selectedRoute.route_long_name || selectedRoute.route_id}
+                </h2>
+                <p style={{ opacity: 0.75 }}>
+                  Trips: {selectedRoute.trip_count} • Stops in sample trip:{" "}
+                  {selectedRoute.stop_count}
+                </p>
+
+                <div style={{ maxHeight: "48vh", overflowY: "auto", marginTop: 14 }}>
+                  {routeTripTimes.map((st, idx) => {
+                    const stop = gtfs.stopsById[String(st.stop_id)];
+                    if (!stop) return null;
+
+                    return (
+                      <button
+                        key={`${st.trip_id}-${st.stop_sequence}`}
+                        onClick={() => setSelectedStop(stop)}
+                        style={{
+                          width: "100%",
+                          textAlign: "left",
+                          padding: 14,
+                          marginBottom: 10,
+                          borderRadius: 18,
+                          border: `1px solid ${borderColor}`,
+                          background: panelBg,
+                          color: textColor,
+                          cursor: "pointer"
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                          <div>
+                            <div style={{ fontWeight: 600 }}>
+                              {idx + 1}. {stop.stop_name}
+                            </div>
+                            <div style={{ fontSize: 12, opacity: 0.72 }}>
+                              {stop.stop_desc || stop.zone_id || "Stop"}
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 14, opacity: 0.8 }}>
+                            {formatClock(parseTimeToSeconds(st.departure_time))}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {gtfs && selectedStop && !selectedRoute && (
+              <div>
+                <h2 style={{ marginTop: 0 }}>{selectedStop.stop_name}</h2>
+                <p style={{ opacity: 0.75 }}>
+                  {selectedStop.stop_desc || selectedStop.zone_id || "Bus Stop"}
+                </p>
+                <p style={{ fontSize: 14 }}>
+                  Lat/Lon: {Number(selectedStop.stop_lat).toFixed(5)},{" "}
+                  {Number(selectedStop.stop_lon).toFixed(5)}
+                </p>
+
+                <div style={{ marginTop: 20 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 10 }}>
+                    Routes serving this stop
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {[...(gtfs.stopRouteMap[String(selectedStop.stop_id)] || new Set())]
+                      .slice(0, 60)
+                      .map((rid) => (
+                        <button
+                          key={rid}
+                          onClick={() =>
+                            setSelectedRoute(
+                              gtfs.routes.find((r) => String(r.route_id) === rid)
+                            )
+                          }
+                          style={{
+                            padding: "8px 12px",
+                            borderRadius: 999,
+                            border: `1px solid ${borderColor}`,
+                            background: panelBg,
+                            color: textColor,
+                            cursor: "pointer"
+                          }}
+                        >
+                          {rid}
+                        </button>
+                      ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Panel({ title, icon, children, panelBg, borderColor }) {
+  return (
+    <div
+      style={{
+        background: panelBg,
+        border: `1px solid ${borderColor}`,
+        borderRadius: 28,
+        padding: 18,
+        boxShadow: "0 12px 30px rgba(0,0,0,0.18)"
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+        {icon}
+        <h3 style={{ margin: 0 }}>{title}</h3>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SearchInput({ value, onChange, placeholder, bg, color, borderColor }) {
+  return (
+    <div style={{ position: "relative" }}>
+      <Search
+        size={16}
+        style={{
+          position: "absolute",
+          left: 12,
+          top: 12,
+          opacity: 0.5
+        }}
+      />
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        style={{
+          width: "100%",
+          padding: "12px 14px 12px 38px",
+          borderRadius: 16,
+          border: `1px solid ${borderColor}`,
+          background: bg,
+          color
+        }}
+      />
+    </div>
+  );
+}
+
+function btnStyle(borderColor, bg, color) {
+  return {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "10px 14px",
+    borderRadius: 16,
+    border: `1px solid ${borderColor}`,
+    background: bg,
+    color,
+    cursor: "pointer"
+  };
+}
+
+const controlRow = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  padding: "8px 0"
+};
